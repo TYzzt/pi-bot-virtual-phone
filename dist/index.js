@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { z } from 'zod';
 // Explicit, owner-only node configuration. Never discover arbitrary ADB devices.
-const configSchema = z.object({ enabled: z.literal(true), adbPath: z.string().startsWith('/'), lockPath: z.string().startsWith('/'), serial: z.literal('emulator-5556'), adbPort: z.literal(5038), ffmpegPath: z.string().startsWith('/') }).strict();
+const configSchema = z.object({ enabled: z.literal(true), adbPath: z.string().startsWith('/'), lockPath: z.string().startsWith('/'), serial: z.string().min(1).max(256).regex(/^[A-Za-z0-9._:\[\]-]+$/), adbPort: z.number().int().min(1).max(65535), ffmpegPath: z.string().startsWith('/') }).strict();
 const point = z.number().int().nonnegative();
 export const phoneEvent = z.discriminatedUnion('type', [
     z.object({ type: z.literal('tap'), x: point.max(719), y: point.max(1279) }).strict(),
@@ -72,7 +72,7 @@ export class PhoneController {
         this.queue = task.then(() => { }, () => { });
         return task.finally(() => { this.pending--; });
     }
-    adb(c, args, input) { return exec(c.adbPath, ['-P', String(c.adbPort), '-s', c.serial, ...args], input); }
+    adb(c, args, input) { return exec(c.adbPath, ['-H', '127.0.0.1', '-P', String(c.adbPort), '-s', c.serial, ...args], input); }
     async capture(c) {
         const png = await this.adb(c, ['exec-out', 'screencap', '-p']);
         if (png.length < 24 || png.readUInt32BE(16) !== 720 || png.readUInt32BE(20) !== 1280)
@@ -96,19 +96,32 @@ export class PhoneController {
         if (!parsed.success)
             throw new Error('手机请求参数无效');
         const p = parsed.data;
+        // Release must still work after the administrator disables/removes configuration.
+        if (method === 'phone.release') {
+            if (!this.lease || p.sessionId !== this.lease.id)
+                throw new Error('人工控制会话已失效');
+            this.release();
+            return { released: true };
+        }
         let c;
         try {
             c = this.config();
         }
         catch (e) {
+            if (this.lease)
+                this.release();
             if (method === 'phone.status')
                 return { available: false, occupied: false };
             throw e;
         }
+        if (this.lease && JSON.stringify(c) !== JSON.stringify(this.lease.config)) {
+            this.release();
+            throw new Error('手机配置已变更，请重新确认设备并接管');
+        }
         if (method === 'phone.status') {
             try {
                 await this.adb(c, ['get-state']);
-                return { available: true, occupied: !!this.lease, phoneId: 'google-play-validation', label: 'Android 15 · Google Play 验证机' };
+                return { available: true, occupied: !!this.lease, phoneId: 'google-play-validation', label: `Android · ${c.serial} · ADB ${c.adbPort}` };
             }
             catch {
                 return { available: false, occupied: false };
@@ -147,7 +160,7 @@ export class PhoneController {
                 lock.kill();
                 throw new Error('手机连接已断开');
             }
-            const lease = { id: randomUUID(), expires: Date.now() + 600000, idle: Date.now() + 45000, lock };
+            const lease = { id: randomUUID(), expires: Date.now() + 600000, idle: Date.now() + 45000, lock, config: c };
             this.lease = lease;
             lock.on('exit', () => { if (this.lease === lease)
                 this.release(); });
@@ -160,15 +173,19 @@ export class PhoneController {
             }
             if (this.lease !== lease)
                 throw new Error('人工控制会话已结束');
+            try {
+                if (JSON.stringify(this.config()) !== JSON.stringify(c))
+                    throw new Error();
+            }
+            catch {
+                this.release();
+                throw new Error('手机配置已变更，请重新确认设备并接管');
+            }
             return { sessionId: lease.id, expiresAt: lease.expires };
         }
         const lease = this.lease;
         if (!lease || p.sessionId !== lease.id || lease.expires <= Date.now() || lease.idle <= Date.now())
             throw new Error('人工控制会话已失效');
-        if (method === 'phone.release') {
-            this.release();
-            return { released: true };
-        }
         if (method === 'phone.frame') {
             const frame = await this.capture(c);
             this.touch(lease);

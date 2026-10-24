@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+*-source.tar.gz
+.env
+.env.*
+phone.json
+*.log
